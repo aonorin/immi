@@ -1,47 +1,74 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use time;
 
 use Draw;
 use Matrix;
+use WidgetId;
 
 use animations::Animation;
+use animations::Interpolation;
 
 /// Contains everything required to draw a widget.
 pub struct DrawContext<'a, D: ?Sized + Draw + 'a> {
+    /// Data that is shared between the draw context and all its children.
+    shared: Arc<Shared<'a, D>>,
+
     matrix: Matrix,
     width: f32,
     height: f32,
-    draw: Arc<Mutex<&'a mut D>>,
 
+    /// Position of the cursor between `-1.0` and `1.0`, where -1.0 is the left or bottom, and 1.0
+    /// is the right or top of the window.
+    ///
+    /// This is the position of the cursor in the original viewport, not in the *current* viewport.
     cursor: Option<[f32; 2]>,
+
     cursor_was_pressed: bool,
     cursor_was_released: bool,
+}
+
+struct Shared<'a, D: ?Sized + Draw + 'a> {
+    draw: Mutex<&'a mut D>,
+    active_widget: Mutex<&'a mut Option<WidgetId>>,
+    next_widget_id: AtomicUsize,
+
+    /// True if the cursor is over an element of the UI.
+    cursor_hovered_widget: AtomicBool,
 }
 
 impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
     // TODO: change this
     /// UNSTABLE, WILL BE CHANGED
     pub fn start(width: f32, height: f32, draw: &'a mut D, cursor: Option<[f32; 2]>,
-                 cursor_was_pressed: bool, cursor_was_released: bool) -> DrawContext<'a, D>
+                 cursor_was_pressed: bool, cursor_was_released: bool,
+                 active_widget: &'a mut Option<WidgetId>) -> DrawContext<'a, D>
     {
         DrawContext {
             matrix: Matrix::identity(),
             width: width,
             height: height,
-            draw: Arc::new(Mutex::new(draw)),
             cursor: cursor,
             cursor_was_pressed: cursor_was_pressed,
             cursor_was_released: cursor_was_released,
+            shared: Arc::new(Shared {
+                draw: Mutex::new(draw),
+                active_widget: Mutex::new(active_widget),
+                next_widget_id: AtomicUsize::new(1),
+                cursor_hovered_widget: AtomicBool::new(false),
+            }),
         }
     }
 
     /// UNSTABLE. Obtains the underlying `draw` object.
     #[inline]
     pub fn draw(&self) -> MutexGuard<&'a mut D> {
-        self.draw.lock().unwrap()
+        self.shared.draw.lock().unwrap()
     }
 
     #[inline]
@@ -49,9 +76,56 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
         &self.matrix
     }
 
+    /// Returns true if the cursor went from up to down in the current frame.
+    ///
+    /// This is the value that was passed when constructing the context.
+    #[inline]
+    pub fn cursor_was_pressed(&self) -> bool {
+        self.cursor_was_pressed
+    }
+
+    /// Returns true if the cursor went from down to up in the current frame.
+    ///
+    /// This is the value that was passed when constructing the context.
     #[inline]
     pub fn cursor_was_released(&self) -> bool {
         self.cursor_was_released
+    }
+
+    /// Returns true if one of the elements that has been drawn is under the mouse cursor.
+    ///
+    /// When you create the context, this value is initally false. Each widget that you draw can
+    /// call `set_cursor_hovered_widget` to pass this value to true.
+    #[inline]
+    pub fn cursor_hovered_widget(&self) -> bool {
+        self.shared.cursor_hovered_widget.load(Ordering::Relaxed)
+    }
+
+    /// Signals the context that the cursor is currently hovering it. This can be later retreived
+    /// with `cursor_hovered_widget()`.
+    #[inline]
+    pub fn set_cursor_hovered_widget(&self) {
+        self.shared.cursor_hovered_widget.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn reserve_widget_id(&self) -> WidgetId {
+        self.shared.next_widget_id.fetch_add(1, Ordering::Relaxed).into()
+    }
+
+    #[inline]
+    pub fn get_active_widget(&self) -> Option<WidgetId> {
+        self.shared.active_widget.lock().unwrap().clone()
+    }
+
+    #[inline]
+    pub fn write_active_widget(&self, id: WidgetId) {
+        **self.shared.active_widget.lock().unwrap() = Some(id);
+    }
+
+    #[inline]
+    pub fn clear_active_widget(&self) {
+        **self.shared.active_widget.lock().unwrap() = None;
     }
 
     /// Returns true if the cursor is currently hovering this part of the viewport.
@@ -125,12 +199,32 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
 
     /// Builds a new draw context containing a subpart of the current context, but with a margin.
     ///
-    /// The margin is expressed in percentage of the surface.
+    /// The margin is expressed in percentage of the surface (between 0.0 and 1.0).
     #[inline]
     pub fn margin(&self, top: f32, right: f32, bottom: f32, left: f32) -> DrawContext<'a, D> {
         // TODO: could be more efficient
-        self.absolute(1.0 - left, 1.0 - top, &Alignment::center())
-            .absolute(1.0 - right, 1.0 - bottom, &Alignment::center())
+        self.rescale(1.0 - left, 1.0 - top, &Alignment::bottom_right())
+            .rescale(1.0 - right, 1.0 - bottom, &Alignment::top_left())
+    }
+
+    /// Builds a new draw context containing a subpart of the current context, but with a margin.
+    ///
+    /// If the width of the surface is inferior to the height then the margin is expressed as a
+    /// percentage of the width, and vice versa.
+    ///
+    /// This guarantees that the size in pixels of the margin is the same if you pass the same
+    /// values.
+    #[inline]
+    pub fn uniform_margin(&self, top: f32, right: f32, bottom: f32, left: f32)
+                          -> DrawContext<'a, D>
+    {
+        let wph = self.width_per_height();
+        let wph = if wph < 1.0 { 1.0 } else { wph };
+
+        let hpw = 1.0 / self.width_per_height();
+        let hpw = if hpw < 1.0 { 1.0 } else { hpw };
+
+        self.margin(top / hpw, right / wph, bottom / hpw, left / wph)
     }
 
     /// Modifies the layout so that the given width per height ratio is respected. The size of the
@@ -192,7 +286,7 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
             matrix: self.matrix * Matrix::translate(0.0, y) * Matrix::scale_wh(1.0, scale),
             width: self.width,
             height: self.height * scale,
-            draw: self.draw.clone(),
+            shared: self.shared.clone(),
             cursor: self.cursor,
             cursor_was_pressed: self.cursor_was_pressed,
             cursor_was_released: self.cursor_was_released,
@@ -218,7 +312,7 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
             matrix: self.matrix * Matrix::translate(x, 0.0) * Matrix::scale_wh(scale, 1.0),
             width: self.width * scale,
             height: self.height,
-            draw: self.draw.clone(),
+            shared: self.shared.clone(),
             cursor: self.cursor,
             cursor_was_pressed: self.cursor_was_pressed,
             cursor_was_released: self.cursor_was_released,
@@ -263,6 +357,7 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
         self.split_weights(weights, false)
     }
 
+    /// Internal implementation of the split functions.
     // TODO: don't return a Vec
     fn split_weights<I>(&self, weights: I, vertical: bool) -> Vec<DrawContext<'a, D>>
                         where I: ExactSizeIterator<Item = f32> + Clone
@@ -298,7 +393,7 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
                 matrix: self.matrix * pos_matrix * scale_matrix,
                 width: new_width,
                 height: new_height,
-                draw: self.draw.clone(),
+                shared: self.shared.clone(),
                 cursor: self.cursor,
                 cursor_was_pressed: self.cursor_was_pressed,
                 cursor_was_released: self.cursor_was_released,
@@ -306,8 +401,15 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
         }).collect()
     }
 
-    pub fn absolute(&self, width_percent: f32, height_percent: f32, alignment: &Alignment)
-                    -> DrawContext<'a, D>
+    /// Changes the dimensions of the context.
+    ///
+    /// The dimensions are a percentage of the current dimensions. For example to divide the width
+    /// by two, you need to pass `0.5`.
+    ///
+    /// The alignment is used to determine the position of the newly-created context relative to
+    /// the old one.
+    pub fn rescale(&self, width_percent: f32, height_percent: f32, alignment: &Alignment)
+                   -> DrawContext<'a, D>
     {
         let x = match alignment.horizontal {
             HorizontalAlignment::Center => 0.0,
@@ -326,26 +428,27 @@ impl<'a, D: ?Sized + Draw + 'a> DrawContext<'a, D> {
                                 * Matrix::scale_wh(width_percent, height_percent),
             width: self.width * width_percent,
             height: self.height * height_percent,
-            draw: self.draw.clone(),
+            shared: self.shared.clone(),
             cursor: self.cursor,
             cursor_was_pressed: self.cursor_was_pressed,
             cursor_was_released: self.cursor_was_released,
         }
     }
 
-    pub fn animate<A>(&self, animation: A, start_time: u64, duration_ns: u64,
-                      initial_pos: [f32; 2]) -> DrawContext<'a, D> where A: Animation
+    pub fn animate<A, I>(&self, animation: A, interpolation: I, start_time: u64,
+                         duration_ns: u64) -> DrawContext<'a, D>
+        where A: Animation, I: Interpolation
     {
         let now = time::precise_time_ns();
 
-        let x = animation.calculate(now, start_time, duration_ns, initial_pos[0]);
-        let y = animation.calculate(now, start_time, duration_ns, initial_pos[1]);
+        let interpolation = interpolation.calculate(now, start_time, duration_ns);
+        let matrix = animation.animate(interpolation);
 
         DrawContext {
-            matrix: self.matrix * Matrix::translate(x, y),
+            matrix: self.matrix * matrix,
             width: self.width,
             height: self.height,
-            draw: self.draw.clone(),
+            shared: self.shared.clone(),
             cursor: self.cursor,
             cursor_was_pressed: self.cursor_was_pressed,
             cursor_was_released: self.cursor_was_released,
@@ -359,7 +462,7 @@ impl<'a, D: ?Sized + Draw + 'a> Clone for DrawContext<'a, D> {
             matrix: self.matrix.clone(),
             width: self.width.clone(),
             height: self.height.clone(),
-            draw: self.draw.clone(),
+            shared: self.shared.clone(),
             cursor: self.cursor.clone(),
             cursor_was_pressed: self.cursor_was_pressed,
             cursor_was_released: self.cursor_was_released,
@@ -368,9 +471,11 @@ impl<'a, D: ?Sized + Draw + 'a> Clone for DrawContext<'a, D> {
 }
 
 /// Represents the alignment of a viewport.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Alignment {
+    /// The horizontal alignment.
     pub horizontal: HorizontalAlignment,
+    /// The vertical alignment.
     pub vertical: VerticalAlignment,
 }
 
@@ -392,32 +497,89 @@ impl Alignment {
             vertical: VerticalAlignment::Bottom,
         }
     }
+
+    /// Shortcut for `(center, top)`.
+    #[inline]
+    pub fn top() -> Alignment {
+        Alignment {
+            horizontal: HorizontalAlignment::Center,
+            vertical: VerticalAlignment::Top,
+        }
+    }
+
+    /// Shortcut for `(right, center)`.
+    #[inline]
+    pub fn right() -> Alignment {
+        Alignment {
+            horizontal: HorizontalAlignment::Right,
+            vertical: VerticalAlignment::Center,
+        }
+    }
+
+    /// Shortcut for `(left, center)`.
+    #[inline]
+    pub fn left() -> Alignment {
+        Alignment {
+            horizontal: HorizontalAlignment::Left,
+            vertical: VerticalAlignment::Center,
+        }
+    }
+
+    /// Shortcut for `(left, top)`.
+    #[inline]
+    pub fn top_left() -> Alignment {
+        Alignment {
+            horizontal: HorizontalAlignment::Left,
+            vertical: VerticalAlignment::Top,
+        }
+    }
+
+    /// Shortcut for `(right, top)`.
+    #[inline]
+    pub fn top_right() -> Alignment {
+        Alignment {
+            horizontal: HorizontalAlignment::Right,
+            vertical: VerticalAlignment::Top,
+        }
+    }
+
+    /// Shortcut for `(right, bottom)`.
+    #[inline]
+    pub fn bottom_right() -> Alignment {
+        Alignment {
+            horizontal: HorizontalAlignment::Right,
+            vertical: VerticalAlignment::Bottom,
+        }
+    }
+
+    /// Shortcut for `(left, bottom)`.
+    #[inline]
+    pub fn bottom_left() -> Alignment {
+        Alignment {
+            horizontal: HorizontalAlignment::Left,
+            vertical: VerticalAlignment::Bottom,
+        }
+    }
 }
 
+/// Describes a horizontal alignment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HorizontalAlignment {
+    /// Align in the middle.
     Center,
+    /// Align left.
     Left,
+    /// Align right.
     Right,
 }
 
-impl Default for HorizontalAlignment {
-    #[inline]
-    fn default() -> HorizontalAlignment {
-        HorizontalAlignment::Center
-    }
-}
-
+/// Describes a vertical alignment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VerticalAlignment {
+    /// Align in the middle.
     Center,
+    /// Align top.
     Top,
+    /// Align bottom.
     Bottom,
-}
-
-impl Default for VerticalAlignment {
-    #[inline]
-    fn default() -> VerticalAlignment {
-        VerticalAlignment::Center
-    }
 }
